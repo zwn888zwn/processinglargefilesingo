@@ -2,15 +2,20 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/exp/mmap"
+	"io"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
-
-	"github.com/stretchr/testify/require"
 )
 
 func Test(t *testing.T) {
@@ -61,14 +66,14 @@ func Benchmark(b *testing.B) {
 				return sequential(file)
 			},
 		},
-		{
-			name:   "Concurrent",
-			file:   "./data/itcont.txt",
-			inputs: [][]int{{1, 1}, {1, 1000}, {10, 1000}, {10, 10000}, {10, 100000}},
-			benchFn: func(file string, numWorkers, batchSize int) result {
-				return concurrent(file, numWorkers, batchSize)
-			},
-		},
+		//{
+		//	name:   "Concurrent",
+		//	file:   "./data/itcont.txt",
+		//	inputs: [][]int{{1, 1}, {1, 1000}, {10, 1000}, {10, 10000}, {10, 100000}},
+		//	benchFn: func(file string, numWorkers, batchSize int) result {
+		//		return concurrent(file, numWorkers, batchSize)
+		//	},
+		//},
 	}
 
 	for _, tb := range tableBenchmarks {
@@ -129,6 +134,60 @@ func processRow(text string) (firstName, fullName, month string) {
 
 // sequential processes a file line by line using processRow.
 func sequential(file string) result {
+	go http.ListenAndServe("0.0.0.0:6060", nil)
+	return mmapReadV3(file)
+	//return mmapReadV2(file)
+	//return mmapRead(file)
+	//return bufioBigBuf(file)
+	//return bufioScan(file)
+	//return readFullFile(file)
+}
+
+func readFullFile(file string) result {
+	res := result{donationMonthFreq: map[string]int{}}
+
+	// track full names
+	fullNamesRegister := make(map[string]bool)
+
+	// track first name frequency
+	firstNameMap := make(map[string]int)
+
+	// 读取整个文件内容
+	content, err := os.ReadFile(file)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 将文件内容按行分割成字符串数组
+	lines := strings.Split(string(content), "\n")
+
+	// 遍历字符串数组，输出每一行内容
+	for _, row := range lines {
+		if row == "" {
+			continue
+		}
+		firstName, fullName, month := processRow(row)
+
+		// add fullname
+		fullNamesRegister[fullName] = true
+
+		// update common firstName
+		firstNameMap[firstName]++
+		if firstNameMap[firstName] > res.commonNameCount {
+			res.commonName = firstName
+			res.commonNameCount = firstNameMap[firstName]
+		}
+		// add month freq
+		res.donationMonthFreq[month]++
+		// update numRows
+		res.numRows++
+		res.peopleCount = len(fullNamesRegister)
+	}
+
+	return res
+}
+
+func bufioScan(file string) result {
 	res := result{donationMonthFreq: map[string]int{}}
 
 	f, err := os.Open(file)
@@ -143,6 +202,263 @@ func sequential(file string) result {
 	firstNameMap := make(map[string]int)
 
 	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		row := scanner.Text()
+		firstName, fullName, month := processRow(row)
+
+		// add fullname
+		fullNamesRegister[fullName] = true
+
+		// update common firstName
+		firstNameMap[firstName]++
+		if firstNameMap[firstName] > res.commonNameCount {
+			res.commonName = firstName
+			res.commonNameCount = firstNameMap[firstName]
+		}
+		// add month freq
+		res.donationMonthFreq[month]++
+		// update numRows
+		res.numRows++
+		res.peopleCount = len(fullNamesRegister)
+	}
+
+	return res
+}
+
+func mmapRead(file string) result {
+	res := result{donationMonthFreq: map[string]int{}}
+	// track full names
+	fullNamesRegister := make(map[string]bool)
+	// track first name frequency
+	firstNameMap := make(map[string]int)
+
+	// Provide the filename & let mmap do the magic
+	r, err := mmap.Open(file)
+	if err != nil {
+		panic(err)
+	}
+
+	noLastLoop := true
+	begin := 0
+
+	for begin < r.Len() && noLastLoop {
+		p := make([]byte, 64*1024*1024)
+
+		//Read the file in memory at an offset of 0 => the entire thing
+		_, err = r.ReadAt(p, int64(begin))
+		if err != nil {
+			if err == io.EOF {
+				noLastLoop = false
+			} else {
+				panic(err)
+			}
+		}
+
+		// 将文件内容按行分割成字符串数组
+		lines := strings.Split(string(p), "\n")
+
+		// 遍历字符串数组，输出每一行内容
+		for i, row := range lines {
+			if i == len(lines)-1 {
+				if row != "" {
+					begin = begin + len(p) - len(row)
+				}
+				continue
+			}
+			firstName, fullName, month := processRow(row)
+
+			// add fullname
+			fullNamesRegister[fullName] = true
+
+			// update common firstName
+			firstNameMap[firstName]++
+			if firstNameMap[firstName] > res.commonNameCount {
+				res.commonName = firstName
+				res.commonNameCount = firstNameMap[firstName]
+			}
+			// add month freq
+			res.donationMonthFreq[month]++
+			// update numRows
+			res.numRows++
+			res.peopleCount = len(fullNamesRegister)
+		}
+	}
+
+	return res
+}
+
+func mmapReadV2(file string) result {
+	res := result{donationMonthFreq: map[string]int{}}
+	// track full names
+	fullNamesRegister := make(map[string]bool)
+	// track first name frequency
+	firstNameMap := make(map[string]int)
+
+	f, err := os.Open(file)
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		panic(err)
+	}
+
+	size := fi.Size()
+
+	noLastLoop := true
+	begin := 0
+	pageSize := 16 * 1024
+	blockSize := 1 * pageSize
+	readLen := blockSize
+	lastStr := ""
+
+	for begin*blockSize < int(size) && noLastLoop {
+		if begin*blockSize+readLen > int(size) {
+			noLastLoop = false
+			readLen = int(size) - begin*blockSize
+		}
+
+		data, err := syscall.Mmap(int(f.Fd()), int64(begin*blockSize), readLen, syscall.PROT_READ, syscall.MAP_SHARED)
+		if err != nil {
+			panic(err)
+		}
+
+		// 将文件内容按行分割成字符串数组
+		lines := strings.Split(lastStr+string(data), "\n")
+
+		// 遍历字符串数组，输出每一行内容
+		for i, row := range lines {
+			if i == len(lines)-1 {
+				if row != "" {
+					lastStr = row
+				}
+				continue
+			}
+			firstName, fullName, month := processRow(row)
+
+			// add fullname
+			fullNamesRegister[fullName] = true
+
+			// update common firstName
+			firstNameMap[firstName]++
+			if firstNameMap[firstName] > res.commonNameCount {
+				res.commonName = firstName
+				res.commonNameCount = firstNameMap[firstName]
+			}
+			// add month freq
+			res.donationMonthFreq[month]++
+			// update numRows
+			res.numRows++
+			res.peopleCount = len(fullNamesRegister)
+		}
+
+		begin++
+		syscall.Munmap(data)
+	}
+
+	return res
+}
+
+func mmapReadV3(file string) result {
+	res := result{donationMonthFreq: map[string]int{}}
+	// track full names
+	fullNamesRegister := make(map[string]bool)
+	// track first name frequency
+	firstNameMap := make(map[string]int)
+
+	f, err := os.Open(file)
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		panic(err)
+	}
+
+	size := fi.Size()
+
+	noLastLoop := true
+	begin := 0
+	pageSize := 16 * 1024
+	blockSize := 10 * 1024 * pageSize
+	readLen := blockSize
+	lastStr := ""
+
+	for begin*blockSize < int(size) && noLastLoop {
+		if begin*blockSize+readLen > int(size) {
+			noLastLoop = false
+			readLen = int(size) - begin*blockSize
+		}
+
+		data, err := syscall.Mmap(int(f.Fd()), int64(begin*blockSize), readLen, syscall.PROT_READ, syscall.MAP_SHARED)
+		if err != nil {
+			panic(err)
+		}
+
+		lastIndex := 0
+		index := 0
+		for index != -1 {
+			if index = bytes.IndexByte(data[lastIndex:], '\n'); index >= 0 {
+				// We have a full newline-terminated line.
+				row := string(data[lastIndex : lastIndex+index])
+				if lastIndex == 0 {
+					row = lastStr + row
+				}
+
+				firstName, fullName, month := processRow(row)
+
+				// add fullname
+				fullNamesRegister[fullName] = true
+
+				// update common firstName
+				firstNameMap[firstName]++
+				if firstNameMap[firstName] > res.commonNameCount {
+					res.commonName = firstName
+					res.commonNameCount = firstNameMap[firstName]
+				}
+				// add month freq
+				res.donationMonthFreq[month]++
+				// update numRows
+				res.numRows++
+				res.peopleCount = len(fullNamesRegister)
+
+				lastIndex = index + lastIndex + 1
+			} else {
+				lastStr = string(data[lastIndex:])
+				break
+			}
+
+		}
+
+		begin++
+		syscall.Munmap(data)
+	}
+
+	return res
+}
+
+func bufioBigBuf(file string) result {
+	res := result{donationMonthFreq: map[string]int{}}
+
+	f, err := os.Open(file)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// track full names
+	fullNamesRegister := make(map[string]bool)
+
+	// track first name frequency
+	firstNameMap := make(map[string]int)
+
+	scanner := bufio.NewScanner(f)
+
+	const maxCapacity = 32 * 1024 * 1024 // 例如，1MB，可读取任何 1MB 的行。
+	buf := make([]byte, maxCapacity)     // 初始缓冲大小 1MB，无需多次扩容
+	scanner.Buffer(buf, maxCapacity)
+
 	for scanner.Scan() {
 		row := scanner.Text()
 		firstName, fullName, month := processRow(row)
@@ -186,12 +502,14 @@ func concurrent(file string, numWorkers, batchSize int) (res result) {
 
 	// reader creates and returns a channel that recieves
 	// batches of rows (of length batchSize) from the file
-	reader := func(ctx context.Context, rowsBatch *[]string) <-chan []string {
+	reader := func(ctx context.Context, rowsBatch *[]string) <-chan []string { //返回只可以用来接收 []string 类型数据的chan
 		out := make(chan []string)
 
 		scanner := bufio.NewScanner(f)
 
 		go func() {
+			// 如果channel c已经被关闭,继续往它发送数据会导致panic: send on closed channel
+			// 但是从这个关闭的channel中不但可以读取出已发送的数据，还可以不断的读取零值
 			defer close(out) // close channel when we are done sending all rows
 
 			for {
@@ -254,7 +572,7 @@ func concurrent(file string, numWorkers, batchSize int) (res result) {
 		multiplexer := func(p <-chan processed) {
 			defer wg.Done()
 
-			for in := range p {
+			for in := range p { // 如果通过range读取，channel关闭后for循环会跳出
 				select {
 				case <-ctx.Done():
 				case out <- in:
